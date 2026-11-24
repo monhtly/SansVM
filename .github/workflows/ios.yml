@@ -1,0 +1,130 @@
+name: Build SansVM IPA
+
+# v1: stock UTM full iOS build, renamed SansVM-unsigned.ipa
+# Built-in StikJIT code is in jit/ in this repo, NOT yet merged into UTM's
+# Xcode project. Merging a helper extension into UTM is high risk and would
+# break the first build. v1 proves the UTM + Sysroot build goes green first,
+# v2 merges the helper.
+#
+# How UTM builds, from utmapp/UTM .github/workflows/build.yml:
+# - job 1 builds Sysroot ios-arm64 from source with
+#   ./scripts/build_dependencies.sh -p ios -a arm64, cached in Actions cache
+# - job 2 restores that Sysroot, then
+#   ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o UTM
+# - package with ./scripts/package.sh ipa
+# Sysroot build is slow on first run (QEMU deps), cached after that.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rebuild_sysroot:
+        description: 'Force rebuild sysroot?'
+        required: true
+        default: 'false'
+
+env:
+  RUNNER_IMAGE: macos-26
+
+jobs:
+  build-sysroot:
+    name: Build Sysroot ios-arm64
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone UTM (recursive)
+        run: |
+          git clone --recursive https://github.com/utmapp/UTM.git utm
+          cd utm && git log -1 --oneline
+
+      - name: Check Sysroot cache
+        id: cache-sysroot
+        uses: actions/cache/restore@v4
+        with:
+          path: utm/sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('utm/scripts/build_dependencies.sh', 'utm/scripts/fixup.sh') }}-${{ hashFiles('utm/patches/**') }}
+          restore-keys: ios-arm64-
+          lookup-only: false
+
+      - name: Setup Path
+        run: |
+          echo "/usr/local/opt/bison/bin:/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+
+      - name: Install Requirements
+        if: steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true'
+        run: |
+          brew uninstall cmake || true
+          brew install bison pkg-config gettext glib-utils libgpg-error nasm make meson cmake
+          brew install llvm spirv-llvm-translator libxcb libxrandr || true
+          pip3 install --break-system-packages --user six pyparsing pyyaml setuptools distlib mako || pip3 install --user six pyparsing pyyaml setuptools distlib mako
+          gem install --user-install xcpretty || true
+          rm -f /usr/local/lib/pkgconfig/*.pc || true
+
+      - name: Build Sysroot
+        if: steps.cache-sysroot.outputs.cache-matched-key == '' || github.event.inputs.rebuild_sysroot == 'true'
+        run: |
+          cd utm
+          ./scripts/build_dependencies.sh -p ios -a arm64
+        env:
+          NCPU: 0
+
+      - name: Save Sysroot cache
+        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        uses: actions/cache/save@v4
+        with:
+          path: utm/sysroot-ios-arm64
+          key: ${{ steps.cache-sysroot.outputs.cache-primary-key }}
+          upload-chunk-size: 1048576
+
+  build-utm:
+    name: Build UTM iOS
+    runs-on: macos-26
+    needs: build-sysroot
+    timeout-minutes: 120
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone UTM (recursive)
+        run: |
+          git clone --recursive https://github.com/utmapp/UTM.git utm
+          cd utm && git log -1 --oneline
+
+      - name: Restore Sysroot cache
+        uses: actions/cache/restore@v4
+        with:
+          path: utm/sysroot-ios-arm64
+          key: ios-arm64-${{ hashFiles('utm/scripts/build_dependencies.sh', 'utm/scripts/fixup.sh') }}-${{ hashFiles('utm/patches/**') }}
+          restore-keys: ios-arm64-
+          fail-on-cache-miss: true
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build UTM for iOS (full, not SE)
+        run: |
+          cd utm
+          ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o UTM
+          ls -lh UTM.xcarchive/Products/Applications/ || true
+
+      - name: Package unsigned IPA
+        run: |
+          cd utm
+          mkdir -p ../output
+          ./scripts/package.sh ipa UTM.xcarchive ../output || \
+            (mkdir -p Payload && cp -r UTM.xcarchive/Products/Applications/UTM.app Payload/ && zip -r ../output/SansVM-unsigned.ipa Payload)
+          ls -lh ../output/
+          # Rename UTM.ipa to SansVM if package.sh made that name
+          if [ -f ../output/UTM.ipa ]; then mv ../output/UTM.ipa ../output/SansVM-unsigned.ipa; fi
+          ls -lh ../output/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SansVM-unsigned
+          path: output/*.ipa
+          if-no-files-found: error
