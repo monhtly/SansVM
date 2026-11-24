@@ -18,8 +18,23 @@ name: Build SansVM IPA
 # UTM.xcodeproj/project.pbxproj; only iOSHelper is 26.0). build_utm.sh has
 # no target option and an env var loses to the project setting, so the
 # build-utm job patches project.pbxproj 15.0 -> 26.0 before building.
+# That patch only fixes dismissalConfirmationDialog (iOS 26 API).
+# AUDIT 2026-11-24: it does NOT fix the other 4 run #5 errors.
+# sceneAccessory / ExternalNonInteractiveAccessory and
+# ToolbarItem.visibilityPriority are iOS 27 APIs, only #available-guarded
+# in UTM source (no canImport check), so they need the iOS 27 SDK:
+# the build-utm job runs on xcode-27 (Xcode 27, iOS 27 SDK). The sysroot
+# job stays on macos-26: its cached libs were built there and are plain
+# C archives, fine to link under Xcode 27.
 # Sysroot stays cached from run #5; its libs were built at 15.0 min, which
 # still links fine for a 26.0 app.
+# Package step needs ldid: UTM's own CI does `brew install ldid` before
+# package.sh; without it package.sh fails at fake_sign and the workflow
+# silently falls back to an unsigned zip with no fake entitlements.
+# Cache-save fix: save whenever the restore was not an exact-key hit
+# (matched != primary), not only on a total miss — otherwise a UTM
+# scripts change makes the sysroot job reuse a stale prefix-matched
+# cache, skip the save, and the UTM job then fails on fail-on-cache-miss.
 
 on:
   push:
@@ -80,7 +95,7 @@ jobs:
           NCPU: 0
 
       - name: Save Sysroot cache
-        if: steps.cache-sysroot.outputs.cache-matched-key == ''
+        if: steps.cache-sysroot.outputs.cache-matched-key != steps.cache-sysroot.outputs.cache-primary-key
         uses: actions/cache/save@v4
         with:
           path: utm/sysroot-ios-arm64
@@ -89,7 +104,7 @@ jobs:
 
   build-utm:
     name: Build UTM iOS
-    runs-on: macos-26
+    runs-on: xcode-27
     needs: build-sysroot
     timeout-minutes: 120
     steps:
@@ -106,6 +121,11 @@ jobs:
           perl -pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = 15\.0;/IPHONEOS_DEPLOYMENT_TARGET = 26.0;/g' utm/UTM.xcodeproj/project.pbxproj
           echo "--- deployment targets after patch ---"
           grep -n "IPHONEOS_DEPLOYMENT_TARGET" utm/UTM.xcodeproj/project.pbxproj
+          # Fail loudly if the patch did not apply (e.g. UTM removed the 15.0 lines)
+          if grep -q "IPHONEOS_DEPLOYMENT_TARGET = 15\.0;" utm/UTM.xcodeproj/project.pbxproj; then
+            echo "ERROR: deployment-target patch did not remove all 15.0 targets"
+            exit 1
+          fi
 
       - name: Restore Sysroot cache
         uses: actions/cache/restore@v4
@@ -115,6 +135,13 @@ jobs:
           restore-keys: ios-arm64-
           fail-on-cache-miss: true
 
+      - name: Select Xcode
+        # Same guard as UTM's own CI: xcode-27 defaults to Xcode 27, but
+        # pin the selection explicitly so a default drift cannot silently
+        # drop us back to an SDK without the iOS 27 APIs.
+        run: |
+          [[ "$(xcode-select -p)" == "/Applications/Xcode.app"* ]] || sudo xcode-select -s "/Applications/Xcode.app"
+
       - name: Show Xcode version
         run: xcodebuild -version
 
@@ -123,6 +150,12 @@ jobs:
           cd utm
           ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o UTM
           ls -lh UTM.xcarchive/Products/Applications/ || true
+
+      - name: Install ldid for fake-signing
+        # package.sh fake-signs with ldid; UTM's own CI installs it before
+        # packaging. Without it package.sh fails and the fallback zip has
+        # no fake entitlements (get-task-allow, dynamic-codesigning, ...).
+        run: brew install ldid
 
       - name: Package unsigned IPA
         run: |
