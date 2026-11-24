@@ -13,6 +13,13 @@ name: Build SansVM IPA
 #   ./scripts/build_utm.sh -k iphoneos -s iOS -a arm64 -o UTM
 # - package with ./scripts/package.sh ipa
 # Sysroot build is slow on first run (QEMU deps), cached after that.
+# iOS 26 fix (run #5 failed on Swift errors): UTM main builds the app
+# target at IPHONEOS_DEPLOYMENT_TARGET 15.0 (project-level in
+# UTM.xcodeproj/project.pbxproj; only iOSHelper is 26.0). build_utm.sh has
+# no target option and an env var loses to the project setting, so the
+# build-utm job patches project.pbxproj 15.0 -> 26.0 before building.
+# Sysroot stays cached from run #5; its libs were built at 15.0 min, which
+# still links fine for a 26.0 app.
 
 on:
   push:
@@ -93,6 +100,12 @@ jobs:
         run: |
           git clone --recursive https://github.com/utmapp/UTM.git utm
           cd utm && git log -1 --oneline
+
+      - name: Set iOS deployment target to 26.0
+        run: |
+          perl -pi -e 's/IPHONEOS_DEPLOYMENT_TARGET = 15\.0;/IPHONEOS_DEPLOYMENT_TARGET = 26.0;/g' utm/UTM.xcodeproj/project.pbxproj
+          echo "--- deployment targets after patch ---"
+          grep -n "IPHONEOS_DEPLOYMENT_TARGET" utm/UTM.xcodeproj/project.pbxproj
 
       - name: Restore Sysroot cache
         uses: actions/cache/restore@v4
